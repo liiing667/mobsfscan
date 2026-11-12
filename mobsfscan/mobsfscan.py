@@ -20,6 +20,59 @@ from mobsfscan.utils import (
 
 logger = init_logger(__name__)
 
+# Finding fields used to build the stable deduplication key.
+_DEDUP_KEY_FIELDS = ('file_path', 'match_lines', 'match_string')
+# Sort order used when a field holds an unexpected (non-scalar) type.
+_TYPE_ORDER = {
+    int: 0,
+    float: 1,
+    str: 2,
+    tuple: 3,
+    list: 4,
+    type(None): 5,
+}
+
+
+def _stable_scalar(value):
+    """Return a hashable, orderable representation of a finding field."""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return tuple(_stable_scalar(item) for item in value)
+    # Dicts/sets/other unhashable values: keep the data via its repr
+    # instead of dropping the finding.
+    return repr(value)
+
+
+def _normalized_lines(match_lines):
+    """Normalize a match_lines value to an (start, end) int pair."""
+    if isinstance(match_lines, (list, tuple)) and len(match_lines) == 2:
+        try:
+            start, end = int(match_lines[0]), int(match_lines[1])
+        except (TypeError, ValueError):
+            pass
+        else:
+            if end < start:
+                end = start
+            return start, end
+    # Malformed span: keep the raw value but make it key-safe.
+    return _stable_scalar(match_lines)
+
+
+def _finding_key(finding):
+    """Stable key: file path, normalized line range and matched content."""
+    return (
+        _stable_scalar(finding.get('file_path')),
+        _normalized_lines(finding.get('match_lines')),
+        _stable_scalar(finding.get('match_string')),
+    )
+
+
+def _sort_key(key):
+    """Deterministic, type-safe ordering for finding keys."""
+    return tuple(
+        (_TYPE_ORDER.get(type(part), 6), part) for part in key)
+
 
 class MobSFScan:
     def __init__(
@@ -176,25 +229,44 @@ class MobSFScan:
         self.deduplicate_files()
 
     def deduplicate_files(self):
-        """Deduplicate files."""
+        """Deduplicate findings across source and XML/manifest scanners.
+
+        Findings are merged on a stable key made of the file path, the
+        normalized line range and the matched content. Raw findings may
+        carry list-valued or otherwise unhashable fields, so the key is
+        built defensively rather than hashing the whole dict; malformed
+        fields are preserved on the merged finding instead of crashing or
+        dropping data. Output order is deterministic.
+        """
         for _, details in self.result['results'].items():
             files = details.get('files')
-            # some results don't have any files,
-            # so we need to check before we continue
-            if files:
-                # "file" here refers to the dictionary containig
-                # the file_path, match_lines, etc.
-                # for each file we create a tuple with it's contents
-                # then using those tuples as keys and
-                # "file" as values we create a dictionary
-                # This means that for each unique "file"
-                # we will get only one entry as we
-                # can't have duplicate keys
-                # Once this is done - convert the dictionary
-                # back to list by grabbing it's values and passing it to list()
-                unique_files = list(
-                    {tuple(sorted(f.items())): f for f in files}.values())
-                details['files'] = unique_files
+            # Some results don't have any files.
+            if not files:
+                continue
+            merged = {}
+            order = []
+            for finding in files:
+                key = _finding_key(finding)
+                current = merged.get(key)
+                if current is None:
+                    merged[key] = dict(finding)
+                    order.append(key)
+                    continue
+                # Same logical finding from another scanner: merge the
+                # sources and conservatively keep any extra/bad fields.
+                for field, value in finding.items():
+                    if field in _DEDUP_KEY_FIELDS:
+                        continue
+                    if field not in current:
+                        current[field] = value
+                    elif current[field] != value:
+                        extras = current.setdefault(
+                            'dedupe_extra_values', {})
+                        extras.setdefault(field, [current[field]])
+                        if value not in extras[field]:
+                            extras[field].append(value)
+            details['files'] = [
+                merged[key] for key in sorted(order, key=_sort_key)]
 
     def format_semgrep(self, sgrep_output):
         """Format semgrep output."""
